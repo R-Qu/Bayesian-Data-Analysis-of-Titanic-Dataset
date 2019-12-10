@@ -1,0 +1,605 @@
+---
+title: "BDA - Project"
+author: "Hamza Hanchi, Rui Qu"
+output:
+  pdf_document:
+    toc: no
+    toc_depth: 1
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '1'
+---
+
+### Introduction
+In this report we look at the data of the passengers on the Titanic. The cruiseship tragically hit an iceberg which led to the death of the majority of the passengers. This dataset is popular to use to showcase statistical knowhow and will give it a try and analyze the data the bayesian way and will be doing so in this manner:
+
+- Overview of the dataset and the analysis problem
+- Data interpreation and prior choice discussion
+- Modeling the reduced model and the full model
+- Model analysis and results
+- Discussion and conclusion
+
+### Dataset
+
+In dataset has information about 891 passenger, we don't have all the data for some of the passengers. We have conclusive data of 714 passengers which will focus on. The information we have about the passengers:
+
+- Name
+- Age
+- Sex
+- Passenger Class - (1st, 2nd, 3rd)     
+- SibSp           - Number of siblings and spouses on the boat
+- Parch           - Number of parents and children on the boat
+- Ticket          - Ticket number
+- Survived 
+- Fare            - Price of the fare
+- Cabin           - Which Cabins belong to the passenger
+- Embarked        - Port of embarkation of passenger (Southampton, Cherbourg, Queenstown)
+
+### Problem analysis
+We want to create a model that has a high prediction accuracy on the survival rate of the passengers on Titanic in terms of the previously mentioned variables. We will create 3 models which we will compare on prediction accuracy and then present the best model. The 1st reduced model will consists of fewer varibles which of which we will select later based on their correlation to survival. The 2nd model will consist of all varibles except for Cabin, Fare and that is because these variables do not provide a lot of useful information as they are highly dependant on other varibles such as fare or cabin and passenger class. We also exclude Ticket because it's just a code that has no relationship to the other varibles and thus will not help the prediction in anyway. The 3rd model we created is a hierarchical model where we treat passenger class in a group with respect to age and sex. we exclude those variavles like what's done in the 1st model.
+
+## project setup
+```{r setup, include=TRUE, echo=TRUE}
+library(corrplot)
+library(brms)
+library(stringr)
+library(bayesplot)
+library(projpred)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(loo)
+require(ggplot2)
+library(titanic)
+
+fulldata <- titanic_train
+testdata <- titanic_test
+```
+
+## Data preparation
+We filter our the passengers with inconclusive data and we also convert the sex string value to numeric values. We do the same for the embarked values so we can create stan models based on the data. Male = 1, Female = 0. C = 0, Q = 1, S = 2.
+
+```{r}
+data <- fulldata
+data$Sex <- ifelse(data$Sex=="male", 1, 0)
+testdata$Sex <- ifelse(testdata$Sex=="male", 1, 0)
+data$Embarked <- ifelse(data$Embarked=="C", 0, ifelse(data$Embarked=="Q", 1, 2))
+testdata$Embarked <- ifelse(testdata$Embarked=="C", 0, ifelse(testdata$Embarked=="Q", 1, 2))
+data = na.omit(data)
+testdata = na.omit(testdata)
+```
+
+# Data visualization
+The ages of the passengers are varying but from the graph we can see that it closely resembles a normal distrubtion with the majority being between the ages 18-40.
+```{r}
+counts <- table(data$Survived,data$Age)
+barplot(table(data$Survived,data$Age),,main="Survivals in terms of age",
+  xlab="Age", ylab="Number of People",legend=rownames(table(fulldata$Survived,fulldata$Age)))
+```
+A slight majority of the people on the boat were 3rd class and the first class had a slight majority over the second class. It can be usefult to mention that the unfiltered data has a larger majority for the third passenger class. From the plot below we can see that survivals in term of passenger class varied, the 3rd class passenger had a higher rate of death while the 1st class had the highest rate of survival.
+```{r}
+counts <- table(data$Pclass,data$Survived)
+barplot(counts,main="Survivals in terms of Passenger Class",
+  xlab="Survival or not", ylab="Number of survivals",
+  legend = rownames(counts), beside=TRUE)
+```
+There were 261 women and 453 men on the dataset and from the plot below we can see that there is a higher rate of death among men.
+```{r}
+counts <- table(data$Sex,data$Survived)
+barplot(counts,main="Survivals in terms of gender",
+  xlab="Survival or not", ylab="Number of survivals",
+  legend = rownames(counts), beside=TRUE)
+```
+290 passengers survived, 424 did not survive (714 in total). From the data we can see that the majority of the passengers did not make it out of the boat alive but a lot of people did survive.
+```{r}
+barplot(table(data$Survived))
+```
+Below we show the correlation plot of the variables in the dataset and we can clearly see that the varibles Passenger class and sex are closely corelated to survival while the other ones played a smaller role. There are also other correlation visible such as the correlation between age and passenger class For the correlation between Sibling/Spouse and Parent/child.
+By looking at the correlation plot we can select which variables to select for our first reduced model and we can clearly see that passenger class and sex are closely correlated to the survival rate and therefore we will use these varibles in the reduced model. We will also use age because we believe that is a natural way of describing a passenger.
+```{r}
+pred <- c("Pclass", "Age", "Sex", "SibSp", "Parch", "Embarked")
+target <- c("Survived")
+formula <- paste("Survived ~", paste(pred, collapse = "+"))
+p <- length(pred)
+n <- nrow(data)
+x = cor(data[, c(target,pred)])
+corrplot(x)
+```
+
+### Data interpretion and prior choice
+
+The relationships of the data seem to be linear and therefore will not explore non-linear solutions for the varibles.
+From this dataset we can quickly see that a majority of people did not survive the trip, we will use the data to make predictions about the survival of someone if he/she was on the boat.
+The types of priors we were considering are uniformative priors, weakly informative/regularizing priors and informative priors.
+Titanic was of course not the first boat to ever have such a tragic fate but it was also the first of it class, the largest and most advanced passengerboat. Therefore we don't believe it would be suitable to use previous knowledge from other tragic events as informative priors for this dataset. Using a weakly informative prior means that we deliberatly use a less informative prior than our actual knowledge which will affect the posterior less than an informative prior but we believe this option isn't the right option with the same reasoning as earlier. An uninformative prior is preferred as we don't believe the prior knowledge is relevant and because we want the data to speak for itself. By following the ecommendations of good deafult priors made by [Stan prior choice recommendations](https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations). Therefore we will use the super-vague but proper prior: normal(0, 1e6) for our model.
+
+Later on we will test the models prior sensitivity with the default prior of brms. Student's t distribution with 3 degrees of freedom, location 0 and scale 10.
+
+### Modeling
+
+We will do a bayesian linear regression where we predict the survivability using a linear model.
+We will be working with two bernoulli linear models, we will be using all the variables except for the fare, cabin and ticker and in the full model and in the reduced model we will only use age, sex and passenger class to predict on that. We use BRMS to generate our stan models. The reason we choose to use the bernoulli family is because we are predicting survivability which has only two possible outcomes.
+
+To run and generate the stan code:
+
+```{r}
+TitanicSelection<- brm(Survived ~ Age + Sex + Pclass, family = bernoulli(),
+    data = data, prior = set_prior('normal(0, 1000000)'),save_all_pars = T)
+
+TitanicFull <- brm(Survived ~ Age + Sex + Pclass + SibSp + Parch + Embarked,  family = bernoulli(),
+    data = data, prior = set_prior('normal(0, 1000000)'), save_all_pars = T )
+
+TitanicHier <- brm(Survived ~ Age + Sex + (Age + Sex |Pclass), family = bernoulli(),
+    data = data, prior = set_prior('normal(0, 1000000)'), save_all_pars = T )
+
+```
+
+
+### Stan models
+
+## Selection Model
+With three varibles: Age, Sex and passenger class.
+```{stan, output.var="esa", eval=FALSE}
+// generated with brms 2.10.0
+functions {
+}
+data {
+  int<lower=1> N;  // number of observations
+  int Y[N];  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  int Kc = K - 1;
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // population-level effects
+  // temporary intercept for centered predictors
+  real Intercept;
+}
+transformed parameters {
+}
+model {
+  // priors including all constants
+  target += normal_lpdf(b | 0, 1000000);
+  target += student_t_lpdf(Intercept | 3, 0, 10);
+  // likelihood including all constants
+  if (!prior_only) {
+    target += bernoulli_logit_glm_lpmf(Y | Xc, Intercept, b);
+  }
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+}
+```
+
+## Full model 
+
+With all relevant variables such as: Age, Sex, Passenger Class, Siblings/Spouse, Parent/childeren, and City of embarktion
+```{stan, output.var="esa", eval=FALSE}
+// generated with brms 2.10.0
+functions {
+}
+data {
+  int<lower=1> N;  // number of observations
+  int Y[N];  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  int Kc = K - 1;
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // population-level effects
+  // temporary intercept for centered predictors
+  real Intercept;
+}
+transformed parameters {
+}
+model {
+  // priors including all constants
+  target += normal_lpdf(b | 0, 1000000);
+  target += student_t_lpdf(Intercept | 3, 0, 10);
+  // likelihood including all constants
+  if (!prior_only) {
+    target += bernoulli_logit_glm_lpmf(Y | Xc, Intercept, b);
+  }
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+}
+```
+
+With three varibles: Age, Sex and passenger class.
+
+## Hierarchical model
+
+```{stan, output.var="esa", eval=FALSE}
+// generated with brms 2.10.0
+functions {
+}
+data {
+  int<lower=1> N;  // number of observations
+  int Y[N];  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  // data for group-level effects of ID 1
+  int<lower=1> N_1;  // number of grouping levels
+  int<lower=1> M_1;  // number of coefficients per level
+  int<lower=1> J_1[N];  // grouping indicator per observation
+  // group-level predictor values
+  vector[N] Z_1_1;
+  vector[N] Z_1_2;
+  vector[N] Z_1_3;
+  int<lower=1> NC_1;  // number of group-level correlations
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  int Kc = K - 1;
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // population-level effects
+  // temporary intercept for centered predictors
+  real Intercept;
+  vector<lower=0>[M_1] sd_1;  // group-level standard deviations
+  matrix[M_1, N_1] z_1;  // standardized group-level effects
+  // cholesky factor of correlation matrix
+  cholesky_factor_corr[M_1] L_1;
+}
+transformed parameters {
+  // actual group-level effects
+  matrix[N_1, M_1] r_1 = (diag_pre_multiply(sd_1, L_1) * z_1)';
+  // using vectors speeds up indexing in loops
+  vector[N_1] r_1_1 = r_1[, 1];
+  vector[N_1] r_1_2 = r_1[, 2];
+  vector[N_1] r_1_3 = r_1[, 3];
+}
+model {
+  // initialize linear predictor term
+  vector[N] mu = Intercept + Xc * b;
+  for (n in 1:N) {
+    // add more terms to the linear predictor
+    mu[n] += r_1_1[J_1[n]] * Z_1_1[n] + r_1_2[J_1[n]] * Z_1_2[n] + r_1_3[J_1[n]] * Z_1_3[n];
+  }
+  // priors including all constants
+  target += normal_lpdf(b | 0, 1000000);
+  target += student_t_lpdf(Intercept | 3, 0, 10);
+  target += student_t_lpdf(sd_1 | 3, 0, 10)
+    - 3 * student_t_lccdf(0 | 3, 0, 10);
+  target += normal_lpdf(to_vector(z_1) | 0, 1);
+  target += lkj_corr_cholesky_lpdf(L_1 | 1);
+  // likelihood including all constants
+  if (!prior_only) {
+    target += bernoulli_logit_lpmf(Y | mu);
+  }
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+  // group-level correlations
+  corr_matrix[M_1] Cor_1 = multiply_lower_tri_self_transpose(L_1);
+  vector<lower=-1,upper=1>[NC_1] cor_1;
+  // extract upper diagonal of correlation matrix
+  for (k in 1:M_1) {
+    for (j in 1:(k - 1)) {
+      cor_1[choose(k - 1, 2) + j] = Cor_1[j, k];
+    }
+  }
+}
+```
+Before comparing the models performances we need to check that they have conveged to make sure the comparision is fair. We do this by looking at the summary of both models.
+
+### Model analysis and results
+
+```{r}
+summary(TitanicSelection)
+check_divergences(TitanicSelection$fit)
+check_treedepth(TitanicSelection$fit)
+```
+
+```{r}
+summary(TitanicFull)
+check_divergences(TitanicFull$fit)
+check_treedepth(TitanicFull$fit)
+```
+
+```{r}
+summary(TitanicHier)
+check_divergences(TitanicHier$fit)
+check_treedepth(TitanicHier$fit)
+```
+
+No divergences were observed in the non-hierarchical models and we believe that is because of the linear nature of the data. And since the summaries of The stan fits are not complaining about the tree depth being exceeding we can conclude that our chains converged well. 
+
+We can also see that the Rhat values for all models are all less than 1.05 which is an indication of well converged chain which means that we can consider the model to be reliable to further analyize. We can also observe very high values for both non-hierarchical models for ESS. The ESS corresponds to the number of independant samples and measures how much independence there is in autocorrelated chains. We can see that our non-hierarchical models have values well over 1000 which is the number that indicates stable estimations for most applications.
+
+The hierarchical model has a small number of diverging chains and the ESS values are lower than we would like them to be which is can indicate unstable estimations but since the Rhat values look good we will continue analyzing this model.
+
+We also need to make sure that the k-values and loo-cv are low enough for us to be able to trust the data. We will make use off Loo-library for the diagnostics.
+
+```{r}
+looSelection <- loo(TitanicSelection)
+looFull <- loo(TitanicFull)
+looHier <- loo(TitanicHier)
+hist(looSelection$diagnostics$pareto_k, 
+     main = "Diagnostic histogram of Parteto k",
+     xlab = "k-values",
+     ylab = "Frequency",
+     freq = FALSE)
+```
+```{r}
+hist(looFull$diagnostics$pareto_k,
+     main = "Diagnostic histogram of Parteto k",
+     xlab = "k-values",
+     ylab = "Frequency",
+     freq = FALSE)
+```
+```{r}
+hist(looHier$diagnostics$pareto_k,
+     main = "Diagnostic histogram of Parteto k",
+     xlab = "k-values",
+     ylab = "Frequency",
+     freq = FALSE)
+```
+We can see that the k-values of all model are less than < 0.5 which means that the raw importance ratios have finite variance and that the central limit holds which means that the models did converge well and with low bias.
+
+Now we can compare both models the find out which one has the better performance.
+
+### Model analysis and results
+
+## Model comparison
+
+We will make use of LOO-CV (leave-one-out cross validation) to compare the models.
+
+```{r}
+cat("\nFull Model PSIS_LOO:" ,looFull$estimates[2], "\n");
+cat("\nSelection Model PSIS_LOO:" , looSelection$estimates[2], "\n");
+cat("\nHierarchical Model PSIS_LOO:" ,looHier$estimates[2], "\n\n");
+loo_compare(list(looSelection, looFull, looHier))
+
+```
+From the PSIS_LOO we can see that the hierarchical model has the highest value compared to the other two models. This value is an indicator of model performance and the highest has better performance. With loo we can estimate the difference in the models expected predictive accuracy and loo_compare will place the model with the largest ELPD (smallest LOOIC) first with zero values because there is no difference between it and the best model (itself). We can see that the hierarchical model performs the best and that there is a big difference between the hierarchical model and the other two non-hierarchical models.
+
+We will from now on go further with the hierarchical model and check the posterior predicitive performance. 
+
+### Graphical posterior predictive analysis
+
+We will use pp_check() to test the posterior predictive checking which will plot the y values from the posterior distribution compared to the true values of y.
+```{r}
+pp_check(TitanicHier, newdata = data)
+```
+From this we can see that the prediction ability of the full model is fairly good, it has better accuracy than the selection model. Some more feature engineering could probably help make the prediction better.
+
+### Sensitivity analysis
+
+We believe that our choice of priors are fair but just to make sure we will try another set of priors for both models, We will use the the alternative priors that we mentioned before. The default priors of brms which is Student's t distribution with 3 degrees of freedom, location 0 and scale 10.
+
+
+```{r, echo=FALSE}
+TitanicSelectionDP<- brm(Survived ~ Age + Sex + Pclass, family = bernoulli(), 
+    data = data,save_all_pars = T)
+TitanicFullDP <- brm(Survived ~ Age + Sex + Pclass + SibSp + Parch + Embarked, family = bernoulli(),
+    data = data, save_all_pars = T )
+TitanicHierDP <- brm(Survived ~ Age + Sex + (Age + Sex |Pclass), family = bernoulli(),
+    data = data, save_all_pars = T )
+summary(TitanicSelectionDP)
+check_divergences(TitanicSelectionDP$fit)
+check_treedepth(TitanicSelectionDP$fit)
+```
+```{r}
+summary(TitanicFullDP)
+check_divergences(TitanicFullDP$fit)
+check_treedepth(TitanicFullDP$fit)
+```
+```{r}
+summary(TitanicHierDP)
+check_divergences(TitanicHierDP$fit)
+check_treedepth(TitanicHierDP$fit)
+```
+```{r}
+loo_compare(looSelection, looFull, loo(TitanicHier), loo(TitanicSelectionDP),loo(TitanicFullDP), loo(TitanicHierDP))
+```
+We get similar results from the summaries as we did for the previous priors so the same diagnostics regarding convergence, tree depth, and  ESS apply. From the loo results we can that the posterior is not very sensitive to the prior as the changes are very small, although here is a slightly bigger change in regards to the hierarchical model. We notice that the Student t prior performs slightly better in the case of the full model and hierarchical model.
+
+### Conclusion and discussion
+
+We were interested in how the different characteristics of the passenger could affect the survival rate of each passenger and if there was a pattern between the passenger that could be observed. We wanted to explore how two different linear approches to predicting survival on the Titanic boat. There were varibles which had a closer correlation to the survivability while other had less and we looked at this relationship when selecting the varibles for our reduced model. The second full model had most varibles except for three varibles which we discussed and excluded. The third model is a hierarchical model used 3 variables like in the first model, while it consider passenger calss with respect to age and genda in a group. We compared the accuracy of 3 models and we can conclude that the hierarchical model performed the best. With the posterior performance assessment we can conclude that the model fairly good and we would recommended this model as an accurate predictior of survivability for the Titanic.
+
+Future improvement could be looking at more advanced future engineering or creating a hierarchical model by grouping the passengers to the varibles with more high correlation with survivability. We believe that these changes would create models with higher prediction accuracy. 
+
+
+### Appendix
+
+## Sensitivity analysis
+
+The Stan models used created to test the sensetivity of our priors:
+
+# Selection Model with brms steudent t(2,0,10) default priors
+
+```{stan, output.var = "anton", eval=FALSE}
+// generated with brms 2.10.0
+functions {
+}
+data {
+  int<lower=1> N;  // number of observations
+  int Y[N];  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  int Kc = K - 1;
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // population-level effects
+  // temporary intercept for centered predictors
+  real Intercept;
+}
+transformed parameters {
+}
+model {
+  // priors including all constants
+  target += student_t_lpdf(Intercept | 3, 0, 10);
+  // likelihood including all constants
+  if (!prior_only) {
+    target += bernoulli_logit_glm_lpmf(Y | Xc, Intercept, b);
+  }
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+}
+```
+
+# Full model with brms student t(2,0,10) default priors
+
+```{stan, output.var = "anton", eval=FALSE}
+// generated with brms 2.10.0
+functions {
+}
+data {
+  int<lower=1> N;  // number of observations
+  int Y[N];  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  int Kc = K - 1;
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // population-level effects
+  // temporary intercept for centered predictors
+  real Intercept;
+}
+transformed parameters {
+}
+model {
+  // priors including all constants
+  target += student_t_lpdf(Intercept | 3, 0, 10);
+  // likelihood including all constants
+  if (!prior_only) {
+    target += bernoulli_logit_glm_lpmf(Y | Xc, Intercept, b);
+  }
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+}
+```
+
+# Hierarchical model with brms studen t(2,0,10) default priors
+
+```{stan, output.var = "anton", eval=FALSE}
+// generated with brms 2.10.0
+functions {
+}
+data {
+  int<lower=1> N;  // number of observations
+  int Y[N];  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  // data for group-level effects of ID 1
+  int<lower=1> N_1;  // number of grouping levels
+  int<lower=1> M_1;  // number of coefficients per level
+  int<lower=1> J_1[N];  // grouping indicator per observation
+  // group-level predictor values
+  vector[N] Z_1_1;
+  vector[N] Z_1_2;
+  vector[N] Z_1_3;
+  int<lower=1> NC_1;  // number of group-level correlations
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  int Kc = K - 1;
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // population-level effects
+  // temporary intercept for centered predictors
+  real Intercept;
+  vector<lower=0>[M_1] sd_1;  // group-level standard deviations
+  matrix[M_1, N_1] z_1;  // standardized group-level effects
+  // cholesky factor of correlation matrix
+  cholesky_factor_corr[M_1] L_1;
+}
+transformed parameters {
+  // actual group-level effects
+  matrix[N_1, M_1] r_1 = (diag_pre_multiply(sd_1, L_1) * z_1)';
+  // using vectors speeds up indexing in loops
+  vector[N_1] r_1_1 = r_1[, 1];
+  vector[N_1] r_1_2 = r_1[, 2];
+  vector[N_1] r_1_3 = r_1[, 3];
+}
+model {
+  // initialize linear predictor term
+  vector[N] mu = Intercept + Xc * b;
+  for (n in 1:N) {
+    // add more terms to the linear predictor
+    mu[n] += r_1_1[J_1[n]] * Z_1_1[n] + r_1_2[J_1[n]] * Z_1_2[n] + r_1_3[J_1[n]] * Z_1_3[n];
+  }
+  // priors including all constants
+  target += student_t_lpdf(Intercept | 3, 0, 10);
+  target += student_t_lpdf(sd_1 | 3, 0, 10)
+    - 3 * student_t_lccdf(0 | 3, 0, 10);
+  target += normal_lpdf(to_vector(z_1) | 0, 1);
+  target += lkj_corr_cholesky_lpdf(L_1 | 1);
+  // likelihood including all constants
+  if (!prior_only) {
+    target += bernoulli_logit_lpmf(Y | mu);
+  }
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+  // group-level correlations
+  corr_matrix[M_1] Cor_1 = multiply_lower_tri_self_transpose(L_1);
+  vector<lower=-1,upper=1>[NC_1] cor_1;
+  // extract upper diagonal of correlation matrix
+  for (k in 1:M_1) {
+    for (j in 1:(k - 1)) {
+      cor_1[choose(k - 1, 2) + j] = Cor_1[j, k];
+    }
+  }
+}
+```
